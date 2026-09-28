@@ -64,6 +64,28 @@ ERROR_CASE = {
     ],
 }
 
+
+def steering_guard_case(assert_op):
+    """转向保护脚本:x0 ∈ [-1,1],非零进入转向包线检查,零值直接终止。"""
+    return {
+        "num_registers": 1,
+        "initial": [{"lo": -1, "hi": 1}],
+        "instructions": [
+            {"id": 0, "op": "branch",
+             "cond": {"coefs": {"0": 1}, "op": "!=", "value": 0}, "target": 2},
+            {"id": 1, "op": "halt"},
+            {"id": 2, "op": "assert",
+             "cond": {"coefs": {"0": 1}, "op": assert_op, "value": 0}},
+            {"id": 3, "op": "halt"},
+        ],
+    }
+
+
+# 危险正值:非零分支接 assert x0 <= 0 —— 正值超包线,必须失败
+DANGER_CASE = steering_guard_case("<=")
+# 安全非零:同一非零分支接 assert x0 != 0 —— 两向都满足,应放行
+SAFE_NONZERO_CASE = steering_guard_case("!=")
+
 _failures = []
 
 
@@ -127,6 +149,38 @@ def main():
           first.get("kind") == "abstract_alarm")
     check("fail case uncovered envelope bound",
           bool(first.get("uncovered")) and first["uncovered"][0].get("bound") == 5)
+
+    code, body = request("POST", "/audit", DANGER_CASE)
+    first = body.get("first_unproven", {})
+    check("danger case verdict is fail (no false pass)",
+          code == 200 and body.get("verdict") == "fail",
+          f"code={code} body={body}")
+    check("danger case guard point is reachable",
+          body.get("points", {}).get("2", {}).get("reachable") is True)
+    check("danger case first unproven point stable at 2",
+          first.get("point") == 2)
+    check("danger case is abstract alarm, not counterexample",
+          first.get("kind") == "abstract_alarm")
+    check("danger case abstract boundary includes positive side x0 <= 1",
+          any(c.get("text") == "x0 <= 1"
+              for c in first.get("abstract_state", [])))
+    check("danger case uncovered envelope bound (1 > required 0)",
+          bool(first.get("uncovered")) and
+          first["uncovered"][0].get("bound") == 1 and
+          first["uncovered"][0].get("required") == 0)
+
+    code, body = request("POST", "/audit", SAFE_NONZERO_CASE)
+    check("safe nonzero case verdict is pass",
+          code == 200 and body.get("verdict") == "pass",
+          f"code={code} body={body}")
+    check("safe nonzero case point is reachable (not marked unreachable)",
+          body.get("points", {}).get("2", {}).get("reachable") is True)
+    entry_checks = body.get("assertions", [{}])[0].get("entry_checks", [])
+    guards = {c.get("branch", {}).get("guard") for c in entry_checks}
+    check("safe nonzero case keeps both positive and negative directions",
+          guards == {"x0 <= -1", "-x0 <= -1"} and
+          all(c.get("implied") for c in entry_checks),
+          f"guards={guards}")
 
     code, body = request("POST", "/audit", ERROR_CASE)
     kinds = {e.get("kind") for e in body.get("errors", [])}

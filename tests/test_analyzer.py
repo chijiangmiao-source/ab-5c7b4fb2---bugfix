@@ -4,6 +4,31 @@ import unittest
 from app.analyzer import analyze
 
 
+def steering_guard_program(assert_op):
+    """姿态工程师的转向保护脚本:x0 初始 [-1,1]。
+
+        0: branch x0 != 0 -> 2   # 非零才进入转向包线检查
+        1: halt                  # 零值直接终止
+        2: assert <cond>         # 转向包线断言
+        3: halt
+
+    cond 为 x0 <= 0 时即"危险正值"脚本(正值超出包线);
+    cond 为 x0 != 0 时即"安全非零"脚本(非零分支两向都满足)。
+    """
+    return {
+        "num_registers": 1,
+        "initial": [{"lo": -1, "hi": 1}],
+        "instructions": [
+            {"id": 0, "op": "branch",
+             "cond": {"coefs": {"0": 1}, "op": "!=", "value": 0}, "target": 2},
+            {"id": 1, "op": "halt"},
+            {"id": 2, "op": "assert",
+             "cond": {"coefs": {"0": 1}, "op": assert_op, "value": 0}},
+            {"id": 3, "op": "halt"},
+        ],
+    }
+
+
 def loop_relation_program():
     """x0 与 x1 同步自增的循环:区间域无法证明 x0==x1,八边形可以。"""
     return {
@@ -192,6 +217,105 @@ class TestFail(unittest.TestCase):
         uncovered = res["first_unproven"]["uncovered"]
         self.assertEqual(len(uncovered), 2)
         self.assertTrue(all(d.get("disjunction") for d in uncovered))
+
+
+class TestSteeringGuardAcceptance(unittest.TestCase):
+    """姿态工程师转向保护脚本的两类核心验收:危险正值必须失败,安全非零放行。"""
+
+    # -- 危险正值:x0 ∈ [-1,1],非零进入 assert x0 <= 0 --
+    def test_dangerous_positive_value_fails(self):
+        res = analyze(steering_guard_program("<="))
+        # 必须返回失败,绝不允许"放行"
+        self.assertEqual(res["verdict"], "fail")
+        # 断言点必须可达——寄存器取正值确会进入该位置,不得标为不可达
+        self.assertTrue(res["points"]["2"]["reachable"])
+        self.assertEqual(res["assertions"][0]["status"], "unproven")
+
+    def test_dangerous_positive_first_unproven_stable(self):
+        res = analyze(steering_guard_program("<="))
+        first = res["first_unproven"]
+        # 首个未证断言稳定编号为程序点 2
+        self.assertEqual(first["point"], 2)
+        self.assertEqual(first["condition"], "x0 <= 0")
+        # 抽象告警,不是伪造的具体反例
+        self.assertEqual(first["kind"], "abstract_alarm")
+        self.assertIn("并非具体执行反例", first["note"])
+
+    def test_dangerous_positive_abstract_boundary_uncovers_positive(self):
+        res = analyze(steering_guard_program("<="))
+        first = res["first_unproven"]
+        # 进入该点的抽象边界包含未被覆盖的正值方向 x0 <= 1 与负侧 -x0 <= 1
+        texts = [c["text"] for c in first["abstract_state"]]
+        self.assertIn("x0 <= 1", texts)
+        self.assertIn("-x0 <= 1", texts)
+        # 未涵盖的包线条件:不变量只能给到上界 1,包线要求 0
+        self.assertEqual(len(first["uncovered"]), 1)
+        u = first["uncovered"][0]
+        self.assertEqual(u["text"], "x0 <= 0")
+        self.assertEqual(u["bound"], 1)
+        self.assertEqual(u["required"], 0)
+        self.assertFalse(u["implied"])
+
+    # -- 安全非零:同一非零分支接 assert x0 != 0 --
+    def test_safe_nonzero_passes_and_point_reachable(self):
+        res = analyze(steering_guard_program("!="))
+        # 放行
+        self.assertEqual(res["verdict"], "pass")
+        # 程序点不能被标为不可达
+        self.assertTrue(res["points"]["2"]["reachable"])
+        self.assertEqual(res["assertions"][0]["status"], "proven")
+        self.assertNotIn("first_unproven", res)
+
+    def test_safe_nonzero_keeps_both_directions(self):
+        res = analyze(steering_guard_program("!="))
+        # 正负两个非零取值都不能因分析过程被丢弃:逐析取支证据须齐备且各自成立
+        checks = res["assertions"][0]["entry_checks"]
+        by_guard = {c["branch"]["guard"]: c for c in checks}
+        self.assertEqual(set(by_guard), {"x0 <= -1", "-x0 <= -1"})
+        self.assertTrue(all(c["implied"] for c in checks))
+        self.assertTrue(all(c["from"] == 0 for c in checks))
+
+    def test_diff_inequality_nonzero_branch_both_dirs_kept(self):
+        # 双寄存器差值 x0 - x1 ∈ [-1,1] 的 != 分支同样保留正负两向
+        payload = {
+            "num_registers": 2,
+            "initial": [{"lo": -1, "hi": 1}, {"lo": 0, "hi": 0}],
+            "instructions": [
+                {"id": 0, "op": "branch",
+                 "cond": {"coefs": {"0": 1, "1": -1}, "op": "!=", "value": 0},
+                 "target": 2},
+                {"id": 1, "op": "halt"},
+                {"id": 2, "op": "assert",
+                 "cond": {"coefs": {"0": 1, "1": -1}, "op": "!=", "value": 0}},
+                {"id": 3, "op": "halt"},
+            ],
+        }
+        res = analyze(payload)
+        self.assertEqual(res["verdict"], "pass")
+        self.assertTrue(res["points"]["2"]["reachable"])
+        guards = {c["branch"]["guard"] for c in res["assertions"][0]["entry_checks"]}
+        self.assertEqual(guards, {"x0 - x1 <= -1", "-x0 + x1 <= -1"})
+
+    def test_diff_inequality_positive_direction_uncovered(self):
+        # 同一非零差值分支接差 <= 0:正差方向超包线,失败并给出上界 1
+        payload = {
+            "num_registers": 2,
+            "initial": [{"lo": -1, "hi": 1}, {"lo": 0, "hi": 0}],
+            "instructions": [
+                {"id": 0, "op": "branch",
+                 "cond": {"coefs": {"0": 1, "1": -1}, "op": "!=", "value": 0},
+                 "target": 2},
+                {"id": 1, "op": "halt"},
+                {"id": 2, "op": "assert",
+                 "cond": {"coefs": {"0": 1, "1": -1}, "op": "<=", "value": 0}},
+                {"id": 3, "op": "halt"},
+            ],
+        }
+        res = analyze(payload)
+        self.assertEqual(res["verdict"], "fail")
+        self.assertTrue(res["points"]["2"]["reachable"])
+        self.assertEqual(res["first_unproven"]["point"], 2)
+        self.assertEqual(res["first_unproven"]["uncovered"][0]["bound"], 1)
 
 
 class TestStructuralErrors(unittest.TestCase):

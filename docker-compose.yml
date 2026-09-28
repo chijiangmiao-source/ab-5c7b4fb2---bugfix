@@ -1,0 +1,34 @@
+# 姿态执行器保护脚本审计服务编排。
+# 宿主机端口通过环境变量 AUDIT_HOST_PORT 配置(默认 8080):
+#   AUDIT_HOST_PORT=9090 docker compose up app
+services:
+  app:
+    build:
+      context: .
+      target: app
+    image: octagon-auditor:1.0.0
+    environment:
+      PORT: "8080"
+      APP_VERSION: "1.0.0"
+    ports:
+      - "${AUDIT_HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  # 验证容器:代码测试 + 镜像构建检查 + HTTP 冒烟,随后退出并以状态码报告结果。
+  # 用法: docker compose up --build --exit-code-from verify --abort-on-container-exit verify
+  verify:
+    build:
+      context: .
+      target: verify   # FROM app 阶段:构建本镜像即复核 app 镜像可构建
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_URL: "http://app:8080"
+      EXPECTED_VERSION: "1.0.0"

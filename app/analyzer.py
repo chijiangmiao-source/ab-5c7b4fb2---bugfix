@@ -21,26 +21,42 @@ from .program import EXIT, parse_program
 MAX_DESCENDING_PASSES = 8
 
 
-def _apply_action(state: Octagon, action: tuple) -> "Octagon | None":
-    """对一条出边施加迁移函数;结果为空(不可行)时返回 None。"""
-    kind = action[0]
+def _apply_meets(state: Octagon, meets) -> "Octagon | None":
     out = state.copy()
+    for terms, k in meets:
+        out.meet(terms, k)
+        if out.empty:
+            return None
+    return out
+
+
+def _edge_transforms(state: Octagon, action: tuple) -> list:
+    """一条出边的迁移结果列表(析取):恒为 0..2 个八边形。
+
+    普通迁移给出 0(不可行)或 1 个结果;!= 的真方向给出两个
+    八边形收窄的并集(e <= k-1 与 -e <= -k-1 各一支),两个方向都不丢弃。
+    """
+    kind = action[0]
+    if kind == "none":
+        return [state.copy()]
     if kind == "set":
+        out = state.copy()
         out.assign_const(action[1], action[2])
-    elif kind == "add":
+        return [] if out.empty else [out]
+    if kind == "add":
+        out = state.copy()
         out.shift_const(action[1], action[2])
-    elif kind == "guard":
-        for terms, k in action[1]:
-            out.meet(terms, k)
-            if out.empty:
-                return None
-    elif kind == "guard_any":
-        for alternative in action[1]:
-            for terms, k in alternative:
-                out.meet(terms, k)
-                if out.empty:
-                    return None
-    return None if out.empty else out
+        return [] if out.empty else [out]
+    if kind == "guard":
+        out = _apply_meets(state, action[1])
+        return [] if out is None else [out]
+    # guard_disjunction:逐支收窄,保留所有可行支(并集语义)
+    results = []
+    for meets in action[1]:
+        out = _apply_meets(state, meets)
+        if out is not None:
+            results.append(out)
+    return results
 
 
 class _Engine:
@@ -84,22 +100,20 @@ class _Engine:
             if src is None:
                 continue
             for e in self.out_edges[p]:
-                y = _apply_action(src, e.action)
-                if y is None:
-                    continue
-                q = e.dst
-                old = inv[q]
-                if old is None:
-                    inv[q] = y
-                else:
-                    joined = old.join(y)
-                    if joined.incl(old):
-                        continue
-                    inv[q] = old.widen(joined) if q in widen_at else joined
-                if q not in in_work:
-                    work.append(q)
-                    in_work.add(q)
-                self.ascending_iterations += 1
+                for y in _edge_transforms(src, e.action):
+                    q = e.dst
+                    old = inv[q]
+                    if old is None:
+                        inv[q] = y
+                    else:
+                        joined = old.join(y)
+                        if joined.incl(old):
+                            continue
+                        inv[q] = old.widen(joined) if q in widen_at else joined
+                    if q not in in_work:
+                        work.append(q)
+                        in_work.add(q)
+                    self.ascending_iterations += 1
 
     # ------------------------------------------------------------------
     # 下降:widening 之后持续复算不变量,逐步回收精度
@@ -117,10 +131,8 @@ class _Engine:
                     s = inv[e.src]
                     if s is None:
                         continue
-                    y = _apply_action(s, e.action)
-                    if y is None:
-                        continue
-                    contrib = y if contrib is None else contrib.join(y)
+                    for y in _edge_transforms(s, e.action):
+                        contrib = y if contrib is None else contrib.join(y)
                 if contrib is None:
                     continue
                 new = contrib.meet_with(cur)
@@ -149,13 +161,29 @@ class _Engine:
             if src is None:
                 continue
             for e in self.out_edges[p]:
-                y = _apply_action(src, e.action)
-                if y is None:
+                results = _edge_transforms(src, e.action)
+                if not results:  # 该方向在此不变量下不可行
                     continue
                 dst = self.inv[e.dst]
-                if dst is None or not y.incl(dst):
+                if dst is None or any(not y.incl(dst) for y in results):
                     violations.append({"from": p, "to": e.dst, "kind": e.kind})
         return violations
+
+    def arrival_components(self, point) -> list:
+        """终态下进入某程序点的逐入边迁移结果(并集中的每个八边形)。
+
+        点不变量是这些分量的凸包;断言蕴含按逐分量判定,从而析取边
+        (!= 真方向)上两个收窄支都能独立支撑包线断言,而不被凸包合并损失。
+        """
+        comps = []
+        if point == 0:
+            comps.append(self.initial)
+        for e in self.in_edges[point]:
+            s = self.inv[e.src]
+            if s is None:
+                continue
+            comps.extend(_edge_transforms(s, e.action))
+        return comps
 
     def run(self) -> list:
         self._ascending()
@@ -220,6 +248,19 @@ def _points_view(engine: _Engine) -> dict:
     return out
 
 
+def _ne_component_evidence(state: Octagon, terms: tuple, k: int) -> dict:
+    """一个到达分量上 != 断言的逐项界核对(析取两支,任一成立即可)。"""
+    details = [
+        _bound_detail(state, terms, k - 1, disjunction=True),
+        _bound_detail(state, neg_terms(terms), -k - 1, disjunction=True),
+    ]
+    return {
+        "invariant": state.canonical(),
+        "bounds": details,
+        "implied": any(d["implied"] for d in details),
+    }
+
+
 def analyze(payload) -> dict:
     """审计入口:返回 pass / fail / error 三种结论之一。"""
     prog, errors = parse_program(payload)
@@ -242,12 +283,25 @@ def analyze(payload) -> dict:
             assertions.append({"point": point, "condition": cond.text, "status": "unreachable"})
             continue
         ok, details = _check_assertion(state, cond)
-        assertions.append({
+        # != 断言在析取分支(!= 真方向)上可能逐入边分量成立而凸包不成立:
+        # 逐分量复核,每个可达分量都须满足该断言,并附分量级证据供独立重放。
+        component_evidence = None
+        if not ok and cond.kind == "ne":
+            comps = engine.arrival_components(point)
+            component_evidence = [
+                _ne_component_evidence(c, cond.terms, cond.k) for c in comps
+            ]
+            ok = all(ev["implied"] for ev in component_evidence) if component_evidence else False
+        entry = {
             "point": point,
             "condition": cond.text,
             "status": "proven" if ok else "unproven",
             "bounds": details,
-        })
+        }
+        if component_evidence is not None:
+            # 凸包界无法证明,但逐入边分量可以;给出分量级界核对
+            entry["component_bounds"] = component_evidence
+        assertions.append(entry)
         if not ok:
             unproven.append((point, cond, state, details))
 

@@ -232,9 +232,10 @@ def _parse_initial(raw, nregs, errors) -> list:
 # 控制流图
 # ----------------------------------------------------------------------
 def _guard_meets(cond: Cond, sense: bool):
-    """分支条件在真/假方向上的八边形收窄项列表;None 表示该方向不可行。
+    """分支条件在真/假方向上的单个八边形收窄项列表;None 表示该方向不可行。
 
-    != 的真方向与 == 的假方向不是八边形约束,按恒等(不收窄)处理,保持可靠。
+    != 的真方向是析取(e <= k-1 或 -e <= -k-1),由 _guard_action 单独
+    构造并集迁移;== 的假方向不是八边形约束,按恒等(不收窄)处理,保持可靠。
     """
     terms, kind, k = cond.terms, cond.kind, cond.k
     if not terms:  # 常量条件直接求值
@@ -251,13 +252,20 @@ def _guard_meets(cond: Cond, sense: bool):
 
 
 def _guard_action(cond: Cond, sense: bool):
-    if cond.kind == "ne" and sense and cond.terms:
+    """构造一条分支方向上的迁移。
+
+    != 的真方向不是单个八边形约束:以两个八边形收窄的并集迁移处理
+    (e <= k-1 或 -e <= -k-1),保证正负两个取值方向都不被丢弃;
+    == 的假方向(e != k)同样不可表示为单个八边形约束,按恒等
+    (不收窄)处理,保持可靠。
+    """
+    if sense and cond.kind == "ne" and cond.terms:
         terms = cond.terms
         alternatives = (
             ((terms, cond.k - 1),),
             ((neg_terms(terms), -cond.k - 1),),
         )
-        return ("guard_any", alternatives)
+        return ("guard_disjunction", alternatives)
     meets = _guard_meets(cond, sense)
     if meets is None:
         return None

@@ -64,6 +64,26 @@ ERROR_CASE = {
     ],
 }
 
+# 姿态保护脚本的公共骨架:x0 ∈ [-1,1];x0 != 0 进入转向包线检查,零值终止。
+def _nonzero_program(envelope_op):
+    return {
+        "num_registers": 1,
+        "initial": [{"lo": -1, "hi": 1}],
+        "instructions": [
+            {"id": 0, "op": "branch",
+             "cond": {"coefs": {"0": 1}, "op": "!=", "value": 0}, "target": 2},
+            {"id": 1, "op": "halt"},
+            {"id": 2, "op": "assert",
+             "cond": {"coefs": {"0": 1}, "op": envelope_op, "value": 0}},
+            {"id": 3, "op": "halt"},
+        ],
+    }
+
+# 危险正值:包线 x0 <= 0,正值 x0=1 确会进入点 2 且越界 → fail(抽象告警,非反例)
+DANGER_CASE = _nonzero_program("<=")
+# 安全非零:包线即 x0 != 0,非零分支两个方向都合法 → pass
+SAFE_NONZERO_CASE = _nonzero_program("!=")
+
 _failures = []
 
 
@@ -127,6 +147,45 @@ def main():
           first.get("kind") == "abstract_alarm")
     check("fail case uncovered envelope bound",
           bool(first.get("uncovered")) and first["uncovered"][0].get("bound") == 5)
+
+    # 危险正值脚本:非零分支后 x0 <= 0 包线,正值方向必须被稳定定位为未证,
+    # 且程序点可达(不得标记不可达而放行),证据为抽象边界而非具体反例。
+    code, body = request("POST", "/audit", DANGER_CASE)
+    first = body.get("first_unproven", {})
+    check("danger case verdict", code == 200 and body.get("verdict") == "fail",
+          f"code={code} body={body}")
+    check("danger case check point is reachable",
+          body.get("points", {}).get("2", {}).get("reachable") is True)
+    check("danger case zero-halt direction also reachable",
+          body.get("points", {}).get("1", {}).get("reachable") is True)
+    check("danger case first unproven point stable", first.get("point") == 2)
+    check("danger case is abstract alarm", first.get("kind") == "abstract_alarm")
+    state_texts = [c.get("text") for c in first.get("abstract_state", [])]
+    check("danger case abstract boundary keeps positive direction",
+          "x0 <= 1" in state_texts and "-x0 <= 1" in state_texts,
+          f"state={state_texts}")
+    uncovered = first.get("uncovered", [])
+    check("danger case uncovered positive side x0 <= 0 with bound 1",
+          len(uncovered) == 1 and uncovered[0].get("bound") == 1
+          and uncovered[0].get("required") == 0,
+          f"uncovered={uncovered}")
+
+    # 安全非零脚本:非零分支直接接 x0 != 0 断言,应放行且点可达;
+    # 正负两个非零取值都不得在分析中被丢弃。
+    code, body = request("POST", "/audit", SAFE_NONZERO_CASE)
+    check("safe nonzero case verdict", code == 200 and body.get("verdict") == "pass",
+          f"code={code} body={body}")
+    check("safe nonzero case point reachable",
+          body.get("points", {}).get("2", {}).get("reachable") is True)
+    assertion = body.get("assertions", [{}])[0]
+    check("safe nonzero case assertion proven", assertion.get("status") == "proven")
+    hull = [c.get("text") for c in body.get("points", {}).get("2", {}).get("invariant", [])]
+    check("safe nonzero case hull keeps both nonzero directions",
+          set(hull) == {"x0 <= 1", "-x0 <= 1"}, f"hull={hull}")
+    comps = assertion.get("component_bounds", [])
+    check("safe nonzero case both disjunct components prove it",
+          len(comps) == 2 and all(c.get("implied") for c in comps),
+          f"components={comps}")
 
     code, body = request("POST", "/audit", ERROR_CASE)
     kinds = {e.get("kind") for e in body.get("errors", [])}

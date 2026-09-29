@@ -116,6 +116,106 @@ class TestPass(unittest.TestCase):
                       {(e["from"], e["kind"]) for e in res["points"]["0"]["incoming"]})
 
 
+def nonzero_protection_program(envelope_op):
+    """姿态工程师脚本:x0 ∈ [-1,1];x0 != 0 时进入转向包线检查,零值终止。
+
+    envelope_op 为包线断言比较符:"<=" 给出危险脚本(正值越界),
+    "!=" 给出安全脚本(非零即合法)。
+    """
+    return {
+        "num_registers": 1,
+        "initial": [{"lo": -1, "hi": 1}],
+        "instructions": [
+            {"id": 0, "op": "branch",
+             "cond": {"coefs": {"0": 1}, "op": "!=", "value": 0}, "target": 2},
+            {"id": 1, "op": "halt"},
+            {"id": 2, "op": "assert",
+             "cond": {"coefs": {"0": 1}, "op": envelope_op, "value": 0}},
+            {"id": 3, "op": "halt"},
+        ],
+    }
+
+
+class TestNonzeroEnvelope(unittest.TestCase):
+    def test_positive_direction_fails_not_unreachable(self):
+        # 危险脚本:正值 x0=1 确会进入点 2 且超出 x0 <= 0 包线
+        res = analyze(nonzero_protection_program("<="))
+        self.assertEqual(res["verdict"], "fail")
+        # 点 2 必须可达,绝不能标为不可达而放行
+        self.assertTrue(res["points"]["2"]["reachable"])
+        self.assertTrue(res["points"]["1"]["reachable"])  # 零值终止方向仍在
+        self.assertEqual(res["assertions"][0]["status"], "unproven")
+        first = res["first_unproven"]
+        self.assertEqual(first["point"], 2)  # 稳定编号:按程序点裁决
+        self.assertEqual(first["kind"], "abstract_alarm")  # 抽象告警,不伪造反例
+        self.assertIn("并非具体执行反例", first["note"])
+        # 未覆盖正值方向的抽象边界:-1 <= x0 <= 1
+        texts = [c["text"] for c in first["abstract_state"]]
+        self.assertIn("x0 <= 1", texts)
+        self.assertIn("-x0 <= 1", texts)
+        # 包线要求 x0 <= 0,不变量实际只能给到 x0 <= 1
+        self.assertEqual(len(first["uncovered"]), 1)
+        self.assertEqual(first["uncovered"][0]["text"], "x0 <= 0")
+        self.assertEqual(first["uncovered"][0]["bound"], 1)
+        self.assertEqual(first["uncovered"][0]["required"], 0)
+
+    def test_nonzero_branch_to_ne_envelope_passes_and_keeps_both_directions(self):
+        # 安全脚本:非零分支直接接 x0 != 0 包线断言
+        res = analyze(nonzero_protection_program("!="))
+        self.assertEqual(res["verdict"], "pass")
+        self.assertTrue(res["points"]["2"]["reachable"])
+        self.assertEqual(res["assertions"][0]["status"], "proven")
+        # 凸包不变量为完整的 -1 <= x0 <= 1(两个方向都未被分析丢弃)
+        texts = [c["text"] for c in res["points"]["2"]["invariant"]]
+        self.assertEqual(set(texts), {"x0 <= 1", "-x0 <= 1"})
+        # 证明来自逐入边分量:!= 真方向的两支(负支、正支)都须满足
+        comps = res["assertions"][0]["component_bounds"]
+        self.assertEqual(len(comps), 2)
+        self.assertTrue(all(c["implied"] for c in comps))
+        comp_texts = [[d["text"] for d in c["invariant"]] for c in comps]
+        self.assertTrue(any("x0 <= -1" in t for t in comp_texts))   # 负方向支:x0 == -1
+        self.assertTrue(any("-x0 <= -1" in t for t in comp_texts))  # 正方向支:x0 == 1
+
+    def test_ne_true_edge_two_register_difference(self):
+        res = analyze({
+            "num_registers": 2,
+            "initial": [{"lo": 0, "hi": 1}, {"lo": 0, "hi": 1}],
+            "instructions": [
+                {"id": 0, "op": "branch",
+                 "cond": {"coefs": {"0": 1, "1": -1}, "op": "!=", "value": 0},
+                 "target": 2},
+                {"id": 1, "op": "halt"},
+                {"id": 2, "op": "assert",
+                 "cond": {"coefs": {"0": 1, "1": -1}, "op": "!=", "value": 0}},
+                {"id": 3, "op": "halt"},
+            ],
+        })
+        self.assertEqual(res["verdict"], "pass")
+        self.assertTrue(res["points"]["2"]["reachable"])
+        self.assertTrue(res["points"]["1"]["reachable"])
+
+    def test_ne_in_loop_with_widening(self):
+        # x0 从 0 自增,x0 != 3 时继续循环;出循环点 x0 <= 3 须可证,
+        # 且 != 回边两支不破坏 widening 终止性与下降复算。
+        res = analyze({
+            "num_registers": 1,
+            "initial": [{"lo": 0, "hi": 0}],
+            "instructions": [
+                {"id": 0, "op": "branch",
+                 "cond": {"coefs": {"0": 1}, "op": "!=", "value": 3}, "target": 3},
+                {"id": 1, "op": "assert",
+                 "cond": {"coefs": {"0": 1}, "op": "<=", "value": 3}},
+                {"id": 2, "op": "halt"},
+                {"id": 3, "op": "add", "reg": 0, "value": 1},
+                {"id": 4, "op": "goto", "target": 0},
+            ],
+        })
+        self.assertEqual(res["verdict"], "pass")
+        self.assertEqual(res["fixpoint"]["widening_points"], [0])
+        self.assertGreaterEqual(res["fixpoint"]["descending_passes"], 1)
+        self.assertTrue(res["fixpoint"]["post_fixpoint_verified"])
+
+
 class TestFail(unittest.TestCase):
     def test_first_unproven_by_point_and_abstract_boundary(self):
         res = analyze({
